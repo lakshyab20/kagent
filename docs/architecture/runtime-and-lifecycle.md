@@ -243,8 +243,13 @@ The worker reverts the same Actor to its last durable snapshot without replaying
 input. A runtime without a durable snapshot returns to its initial state.
 An interrupted revert continues from REVERTING; a lost response can be reconciled
 from SUSPENDED. Already admitted recoveries survive API restarts and retry on the
-existing recovery interval in ID-ordered pages of at most 100. The worker does
-not inspect READY Sessions or initiate a new recovery.
+existing recovery interval in ID-ordered pages of at most 100. Automatic recovery is disabled by default. Set `sessions.automaticRecovery: true`
+in the controller configuration to sweep READY Sessions on the same interval,
+including idle Sessions and waits. Each sweep lists every Actor in the atespaces
+that hold a READY Session and reads only the CRASHED ones individually, so a crash
+is found within one interval at any fleet size. A failed or expired sweep starts
+again at the next interval. Disabling it does not strand already admitted
+recoveries.
 
 A successful revert returns the Session to READY with the same Actor suspended.
 The next authorized interaction resumes it through Substrate ingress. Runtime
@@ -258,7 +263,8 @@ responses read the stored record and omit `recovery`. An unavailable or
 replaced Actor leaves the observation unknown and does not prevent history
 reads. The observation and `RevertSession` share one crash check, so chat offers
 a revert exactly when the revert would be admitted. Chat offers that revert and
-the existing fork action for a saved READY checkpoint.
+the existing fork action for a saved READY checkpoint. With automatic recovery
+enabled, chat also shows that recovery is in progress and keeps both choices.
 
 Recovery records exact task and message identities for user inputs after the
 retained snapshot boundary, including accepted inputs not yet published. Chat

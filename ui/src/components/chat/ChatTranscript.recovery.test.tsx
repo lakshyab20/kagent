@@ -39,12 +39,12 @@ describe("persisted recovery message failures", () => {
     { taskId: "other-task", messageId: "discarded" },
     { taskId: "task", messageId: "other-message" },
   ])("requires both task and message identity: %j", (reference) => {
-    render(transcript({ failedMessages: [reference] }));
+    render(transcript({ automatic: false, failedMessages: [reference] }));
     expect(screen.queryByText(NOTE)).not.toBeInTheDocument();
   });
 
   it("marks the rest of the discarded turn, but not earlier history or another task", () => {
-    render(transcript({ failedMessages: [{ taskId: "task", messageId: "discarded" }] }));
+    render(transcript({ automatic: false, failedMessages: [{ taskId: "task", messageId: "discarded" }] }));
     expect(message("discarded")).toHaveAttribute("data-discarded", "message");
     expect(message("partial")).toHaveAttribute("data-discarded", "reply");
     expect(within(message("partial")).getByText(/Not remembered after recovery/)).toBeInTheDocument();
@@ -53,14 +53,14 @@ describe("persisted recovery message failures", () => {
   });
 
   it("does not announce persisted notes as a live region", () => {
-    render(transcript({ failedMessages: [{ taskId: "task", messageId: "discarded" }] }));
+    render(transcript({ automatic: false, failedMessages: [{ taskId: "task", messageId: "discarded" }] }));
     expect(within(message("discarded")).getByText(NOTE).closest("[role=status],[aria-live]")).toBeNull();
   });
 
   it("retains the failure indicator in a read-only shared transcript", () => {
     render(
       <ThemeProvider theme={themeFor("dark")}>
-        <ChatTranscript chat={chat} recovery={{ failedMessages: [{ taskId: "task", messageId: "discarded" }] }} readOnly />
+        <ChatTranscript chat={chat} recovery={{ automatic: false, failedMessages: [{ taskId: "task", messageId: "discarded" }] }} readOnly />
       </ThemeProvider>,
     );
     expect(within(message("discarded")).getByText(NOTE)).toBeInTheDocument();
@@ -70,22 +70,22 @@ describe("persisted recovery message failures", () => {
     const pending: ChatController = { ...chat, turnState: "input_required", turnPhase: "awaiting_input", pendingQuestion: { kind: "unknown", taskId: "task" } };
     const view = render(
       <ThemeProvider theme={themeFor("dark")}>
-        <ChatTranscript chat={pending} recovery={{ needed: false, failedMessages: [{ taskId: "task", messageId: "discarded" }] }} />
+        <ChatTranscript chat={pending} recovery={{ needed: false, automatic: false, failedMessages: [{ taskId: "task", messageId: "discarded" }] }} />
       </ThemeProvider>,
     );
     expect(screen.queryByTestId("chat-awaiting-reply")).not.toBeInTheDocument();
     expect(screen.queryByText("Waiting for you")).not.toBeInTheDocument();
     view.rerender(
       <ThemeProvider theme={themeFor("dark")}>
-        <ChatTranscript chat={pending} recovery={{ needed: false, failedMessages: [] }} />
+        <ChatTranscript chat={pending} recovery={{ needed: false, automatic: false, failedMessages: [] }} />
       </ThemeProvider>,
     );
     expect(screen.getByTestId("chat-awaiting-reply")).toBeInTheDocument();
   });
 
   it("marks the exact discarded message after refresh and reload, preserving captured HITL history", () => {
-    const recovery = { failedMessages: [{ taskId: "task", messageId: "discarded" }] };
-    const view = render(transcript({ failedMessages: [] }));
+    const recovery = { automatic: false, failedMessages: [{ taskId: "task", messageId: "discarded" }] };
+    const view = render(transcript({ automatic: false, failedMessages: [] }));
     view.rerender(transcript(recovery));
     expect(within(message("discarded")).getByText(NOTE)).toHaveTextContent("the agent does not remember this message or the replies after it");
     expect(within(message("captured-answer")).queryByText(NOTE)).not.toBeInTheDocument();

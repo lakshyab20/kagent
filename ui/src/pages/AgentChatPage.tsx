@@ -16,6 +16,7 @@ import { ChatTranscript } from "@/components/chat/ChatTranscript";
 import { SessionRecoveryAlert } from "@/components/chat/SessionRecoveryAlert";
 import { TaskPushNotificationsModal } from "@/components/chat/TaskPushNotificationsModal";
 import { isLifecycleBusy } from "@/components/chat/lifecycleReading";
+import { isApiError } from "@/api/ApiError";
 import { paths } from "@/router/routes";
 import {
   apiClient,
@@ -438,9 +439,17 @@ export function AgentChatPage() {
     // and depending on it would re-run this on each one.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, chat.isLoadingHistory]);
+  /*
+   * Revert is disabled only while this page's own request is in flight. An admitted
+   * recovery is not enough: it keeps its operation through every failed attempt, and a
+   * revert sent meanwhile joins it rather than starting another. The ref closes the gap
+   * before React re-renders the disabled button, so a double click sends one request.
+   */
   const [isReverting, setReverting] = useState(false);
+  const revertInFlight = useRef(false);
   const revertRuntime = useCallback(async () => {
-    if (!id) return;
+    if (!id || revertInFlight.current) return;
+    revertInFlight.current = true;
     setReverting(true);
     let reverted = false;
     try {
@@ -449,11 +458,23 @@ export function AgentChatPage() {
       await instance.refresh();
       await chat.refreshTranscript();
     } catch (cause: unknown) {
+      if (!reverted && isApiError(cause) && cause.reason === "KAGENT_SESSION_RUNTIME_NOT_CRASHED") {
+        // Another attempt, automatic or from another tab, recovered it first. The
+        // conversation is fine; re-reading it clears the alert.
+        try {
+          await instance.refresh();
+          await chat.refreshTranscript();
+        } catch (refreshCause: unknown) {
+          console.error("Could not re-read the recovered conversation:", refreshCause);
+        }
+        return;
+      }
       const reason = cause instanceof Error ? cause.message : String(cause);
       toast.error(reverted
         ? `Recovery completed. Could not refresh the conversation: ${reason}`
         : `Could not recover the conversation: ${reason}`);
     } finally {
+      revertInFlight.current = false;
       setReverting(false);
     }
   }, [id, instance, chat]);
@@ -664,6 +685,7 @@ export function AgentChatPage() {
             recovery={recovery}
             checkpoints={checkpoints.data ?? []}
             isRecovering={isReverting || instance.data?.operation === "resume"}
+            isReverting={isReverting}
             onRevert={revertRuntime}
           />
 

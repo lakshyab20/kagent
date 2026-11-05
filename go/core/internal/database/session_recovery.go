@@ -18,8 +18,9 @@ import (
 // that the recorded Actor crashed. Transport failures cannot admit this work.
 const SessionRuntimeCrashed = "RuntimeCrashed"
 
-// ListSessionRecoveryCandidates finds recoveries admitted by an explicit request.
-// Retrying durable work cannot admit recovery for a READY Session.
+// ListSessionRecoveryCandidates finds recoveries admitted by an explicit request
+// or by automatic recovery. Retrying durable work cannot admit recovery for a
+// READY Session, so disabling automatic recovery does not strand an admitted one.
 func (c *Client) ListSessionRecoveryCandidates(ctx context.Context, afterID string, limit int) ([]*apiv1.Session, error) {
 	rows, err := queryMany(ctx, c.db, `
 		SELECT id, user_id, prepared_revision, state, data, operation, context_id,
@@ -41,6 +42,19 @@ func (c *Client) ListSessionRecoveryCandidates(ctx context.Context, afterID stri
 		result = append(result, session)
 	}
 	return result, nil
+}
+
+// ListSessionRecoveryAtespaces returns the atespaces that hold an Actor of a READY
+// Session, in order. Automatic recovery lists Actors in these atespaces to find
+// crashes, so its Substrate reads grow with Actor pages rather than one read per
+// Session.
+func (c *Client) ListSessionRecoveryAtespaces(ctx context.Context) ([]string, error) {
+	return queryMany(ctx, c.db, `
+		SELECT DISTINCT r.actor_template_atespace
+		FROM session_record i JOIN runtime_revision r ON r.revision = i.prepared_revision
+		WHERE i.state = 'RUNTIME_STATE_READY' AND i.operation = 'RUNTIME_OPERATION_NONE'
+		ORDER BY 1
+	`, pgx.RowTo[string])
 }
 
 // SessionRecoveryFence is what crash recovery reads before it observes Substrate.

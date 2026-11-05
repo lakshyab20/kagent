@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -42,6 +43,7 @@ func (w *ActorWorkflow) Recovery(ctx context.Context, session *apiv1.Session) (*
 		recovery = &apiv1.SessionRecovery{}
 	}
 	recovery.Needed = nil
+	recovery.Automatic = w.automaticRecovery
 	if crashRecoveryAdmitted(session) {
 		recovery.Needed = new(true)
 		return recovery, nil
@@ -120,14 +122,28 @@ func (w *ActorWorkflow) observeCrash(ctx context.Context, session *apiv1.Session
 	return crashObservation{generation: fence.Generation, actor: actor}, nil
 }
 
+// crashScanPageSize is ate-api's largest Actor page.
+const crashScanPageSize = 1000
+
 // scanRecovery runs one recovery interval and returns the cursor for the next.
-// Admitted recoveries page through PostgreSQL in ID order.
+// Admitted recoveries page through PostgreSQL in ID order; with automatic
+// recovery enabled, crashed runtimes of READY Sessions come from Substrate's
+// Actor lists.
 func (w *ActorWorkflow) scanRecovery(ctx context.Context, afterID string) string {
 	scanCtx, cancel := context.WithTimeout(ctx, database.RuntimeOperationTimeout)
 	after, err := w.recoverSessionPage(scanCtx, afterID)
 	cancel()
 	if err != nil && ctx.Err() == nil {
 		logging.FromContext(ctx).ErrorContext(ctx, "scan interrupted sessions", "error", err)
+	}
+	if !w.automaticRecovery {
+		return after
+	}
+	scanCtx, cancel = context.WithTimeout(ctx, database.RuntimeOperationTimeout)
+	err = w.recoverCrashedActors(scanCtx)
+	cancel()
+	if err != nil && ctx.Err() == nil {
+		logging.FromContext(ctx).ErrorContext(ctx, "scan crashed runtimes", "error", err)
 	}
 	return after
 }
@@ -151,6 +167,84 @@ func (w *ActorWorkflow) recoverSessionPage(ctx context.Context, afterID string) 
 		afterID = ""
 	}
 	return afterID, nil
+}
+
+// recoverCrashedActors sweeps every Actor in each atespace that holds a READY
+// Session, so a crash is found within one recovery interval however many Sessions
+// exist. Reading each Session's Actor instead costs one Substrate call per Session;
+// at 100 per interval, a fleet of 10,000 idle Sessions took 100 intervals to reach a
+// crash. A listed CRASHED state only nominates a Session. Revert observes the Actor
+// again and admits recovery only for the recorded, still-crashed Actor.
+//
+// An atespace that fails to list does not stop the others. The next interval
+// sweeps again from the start, so an Actor missed by a failed or expired sweep is
+// found then.
+func (w *ActorWorkflow) recoverCrashedActors(ctx context.Context) error {
+	atespaces, err := w.store.ListSessionRecoveryAtespaces(ctx)
+	if err != nil {
+		return fmt.Errorf("list Session atespaces: %w", err)
+	}
+	var errs []error
+	for _, atespace := range atespaces {
+		if err := w.recoverCrashedActorsIn(ctx, atespace); err != nil {
+			errs = append(errs, fmt.Errorf("atespace %s: %w", atespace, err))
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (w *ActorWorkflow) recoverCrashedActorsIn(ctx context.Context, atespace string) error {
+	token := ""
+	for {
+		actors, next, err := w.actors.ListActorsPage(ctx, atespace, crashScanPageSize, token)
+		if err != nil {
+			return fmt.Errorf("list Actors: %w", err)
+		}
+		for _, actor := range actors {
+			if actor.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_CRASHED {
+				continue
+			}
+			if session := w.crashedActorSession(ctx, actor); session != nil {
+				w.recoverCandidate(ctx, session)
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+		}
+		// A page can be empty and still not be the last, so only the token ends the sweep.
+		if token, err = substrate.AdvancePageToken(token, next); err != nil {
+			return err
+		}
+		if token == "" {
+			return nil
+		}
+	}
+}
+
+// crashedActorSession returns the live Session bound to actor, or nil. An Actor
+// that is not a Session runtime, or that belongs to a deleted or replaced Session,
+// nominates nothing.
+func (w *ActorWorkflow) crashedActorSession(ctx context.Context, actor *ateapipb.Actor) *apiv1.Session {
+	name := actor.GetMetadata().GetName()
+	id, ok := strings.CutPrefix(name, substrate.ActorName(""))
+	if !ok {
+		return nil
+	}
+	parsed, err := uuid.Parse(id)
+	if err != nil || substrate.ActorName(parsed.String()) != name {
+		return nil
+	}
+	session, err := w.store.GetSessionForRuntime(ctx, parsed.String(), actor.GetMetadata().GetUid())
+	if err != nil {
+		if !errors.Is(err, database.ErrNotFound) && ctx.Err() == nil {
+			logging.FromContext(ctx).ErrorContext(ctx, "load crashed session", "session_id", parsed.String(), "error", err)
+		}
+		return nil
+	}
+	return session
 }
 
 func (w *ActorWorkflow) recoverCandidate(ctx context.Context, session *apiv1.Session) {

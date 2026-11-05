@@ -29,7 +29,8 @@ func (w *ActorWorkflow) wakeQuiescence() {
 }
 
 // Start suspends idle sessions to VOLUMES independently of task publication and
-// retries crash recoveries admitted by explicit requests.
+// retries crash recoveries admitted by explicit requests or, when enabled, by
+// automatic recovery.
 // Startup and periodic scans discover idle work missed by local signals. Workers
 // drain claims with bounded concurrency. Crash recovery scans on its own ticker, so
 // a slow idle suspension cannot delay a recovery retry and a slow revert cannot
@@ -76,10 +77,10 @@ func (w *ActorWorkflow) Start(ctx context.Context) error {
 	return nil
 }
 
-// recoverCrashedSessions runs one recovery scan per tick.
-// The cursor carries across ticks, so a large backlog cannot starve the Sessions
-// after its first page, and an Actor that stays unreadable is revisited when the
-// scan wraps.
+// recoverCrashedSessions runs one recovery scan per tick: a page of admitted
+// crash recoveries, then the automatic sweep when it is enabled. The cursor
+// carries across ticks, so a large backlog cannot starve the Sessions after its
+// first page, and an Actor that stays unreadable is revisited when the scan wraps.
 func (w *ActorWorkflow) recoverCrashedSessions(ctx context.Context) {
 	ticker := time.NewTicker(w.recoveryInterval)
 	defer ticker.Stop()

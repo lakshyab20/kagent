@@ -58,6 +58,8 @@ message SessionRecovery {
   // Whether the recorded runtime crashed and needs a revert. Unset when
   // GetSession could not observe the runtime; clients must not offer a revert then.
   optional bool needed = 1;
+  // Whether automatic recovery is enabled for this controller.
+  bool automatic = 2;
   // User messages the restored runtime does not remember, from every revert of
   // this Session. Each appears once. Their A2A history remains available,
   // including completed task results, so the list lasts as long as the

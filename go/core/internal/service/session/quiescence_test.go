@@ -36,6 +36,10 @@ func (s *idleQuiescenceStore) ListSessionRecoveryCandidates(context.Context, str
 	return nil, nil
 }
 
+func (s *idleQuiescenceStore) ListSessionRecoveryAtespaces(context.Context) ([]string, error) {
+	return nil, nil
+}
+
 func (s *idleQuiescenceStore) ClaimSessionQuiescence(context.Context) (*database.SessionQuiescence, error) {
 	s.claims.Add(1)
 	if s.claimErr != nil {
@@ -58,7 +62,7 @@ func TestConfiguredQuiescenceInterval(t *testing.T) {
 		defer cancel()
 		store := &idleQuiescenceStore{}
 		done := make(chan error, 1)
-		go func() { done <- NewActorWorkflow(store, nil, make(chan struct{}, 1), 20*time.Minute).Start(ctx) }()
+		go func() { done <- NewActorWorkflow(store, nil, make(chan struct{}, 1), 20*time.Minute, false).Start(ctx) }()
 		synctest.Wait()
 		require.EqualValues(t, 4, store.claims.Load())
 		require.EqualValues(t, 4, store.pendingChecks.Load())
@@ -78,7 +82,7 @@ func TestQuiescenceWakeRacesIdleScan(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 		store := &idleQuiescenceStore{}
-		workflow := NewActorWorkflow(store, nil, make(chan struct{}, 1), time.Hour)
+		workflow := NewActorWorkflow(store, nil, make(chan struct{}, 1), time.Hour, false)
 		var once sync.Once
 		store.beforeIdle = func() { once.Do(workflow.wakeQuiescence) }
 		done := make(chan error, 1)
@@ -118,7 +122,7 @@ func TestQuiescenceRetriesPendingWorkAndDatabaseErrors(t *testing.T) {
 				store := &idleQuiescenceStore{claimErr: test.claimErr, pendingErr: test.pendingErr}
 				store.pending.Store(test.pending)
 				done := make(chan error, 1)
-				go func() { done <- NewActorWorkflow(store, nil, make(chan struct{}, 1), time.Hour).Start(ctx) }()
+				go func() { done <- NewActorWorkflow(store, nil, make(chan struct{}, 1), time.Hour, false).Start(ctx) }()
 				synctest.Wait()
 				require.EqualValues(t, 4, store.claims.Load())
 				time.Sleep(time.Second)
@@ -144,7 +148,7 @@ func TestIdleLifecycleDoesNotOwnTaskPublication(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			store, session := lifecycleFixture(t)
 			base := &lifecycleTestActors{actors: map[string]*ateapipb.Actor{}}
-			session, err := NewActorWorkflow(store, base, make(chan struct{}, 1), time.Second).Create(t.Context(), session)
+			session, err := NewActorWorkflow(store, base, make(chan struct{}, 1), time.Second, false).Create(t.Context(), session)
 			require.NoError(t, err)
 			message := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("hello"))
 			message.ContextID = session.ContextId
@@ -171,7 +175,7 @@ func TestIdleLifecycleDoesNotOwnTaskPublication(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			done := make(chan error, 1)
 			writes := &quiescenceRetryStore{lifecycleTestStore: store, failures: test.finishFailures}
-			workflow := NewActorWorkflow(writes, actors, make(chan struct{}, 1), time.Hour)
+			workflow := NewActorWorkflow(writes, actors, make(chan struct{}, 1), time.Hour, false)
 			go func() { done <- workflow.Start(ctx) }()
 			t.Cleanup(func() { cancel(); require.NoError(t, <-done) })
 			select {

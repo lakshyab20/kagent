@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -29,7 +30,7 @@ import (
 func TestActorWorkflowLifecycle(t *testing.T) {
 	store, session := lifecycleFixture(t)
 	actors := &lifecycleTestActors{actors: map[string]*ateapipb.Actor{}}
-	workflow := NewActorWorkflow(store, actors, make(chan struct{}, 1), time.Second)
+	workflow := NewActorWorkflow(store, actors, make(chan struct{}, 1), time.Second, false)
 
 	created, err := workflow.Create(context.Background(), session)
 	if err != nil {
@@ -81,7 +82,7 @@ func TestActorWorkflowRejectsReplacedRuntime(t *testing.T) {
 		t.Run(operation, func(t *testing.T) {
 			store, session := lifecycleFixture(t)
 			actors := &lifecycleTestActors{actors: map[string]*ateapipb.Actor{}}
-			workflow := NewActorWorkflow(store, actors, make(chan struct{}, 1), time.Second)
+			workflow := NewActorWorkflow(store, actors, make(chan struct{}, 1), time.Second, false)
 			session, err := workflow.Create(t.Context(), session)
 			require.NoError(t, err)
 			actor := actors.actors[actorKey("team-a", substrate.ActorName(session.Id))]
@@ -106,7 +107,7 @@ func TestActorWorkflowForkCreatesSuspendedActorFromCheckpoint(t *testing.T) {
 	store, session := lifecycleFixture(t)
 	actors := &lifecycleTestActors{actors: map[string]*ateapipb.Actor{}}
 	session, checkpointID := lifecycleForkFixture(t, store, actors, session)
-	fork, err := NewActorWorkflow(store, actors, make(chan struct{}, 1), time.Second).Create(t.Context(), session)
+	fork, err := NewActorWorkflow(store, actors, make(chan struct{}, 1), time.Second, false).Create(t.Context(), session)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +118,7 @@ func TestActorWorkflowForkCreatesSuspendedActorFromCheckpoint(t *testing.T) {
 		t.Fatalf("fork = %+v, actor = %+v", fork, actor)
 	}
 	actor.Status.Snapshots[0].DurableSnapshot.Object.SnapshotUri = "s3://snapshots/later-turn"
-	replayed, err := NewActorWorkflow(store, actors, make(chan struct{}, 1), time.Second).Create(t.Context(), session)
+	replayed, err := NewActorWorkflow(store, actors, make(chan struct{}, 1), time.Second, false).Create(t.Context(), session)
 	require.NoError(t, err)
 	require.True(t, proto.Equal(fork, replayed), "a retry returns the current session without revalidating later Actor state")
 }
@@ -168,6 +169,11 @@ type lifecycleTestActors struct {
 	policyRevision string
 	policyActor    string
 	policyCalls    int
+	// listPageSize overrides the requested Actor page size so tests can page small fleets.
+	listPageSize int
+	listErr      error
+	listCalls    int
+	reads        int
 }
 
 func actorKey(atespace, name string) string { return atespace + "/" + name }
@@ -175,11 +181,42 @@ func actorKey(atespace, name string) string { return atespace + "/" + name }
 func (a *lifecycleTestActors) GetActor(_ context.Context, atespace, name string) (*ateapipb.Actor, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.reads++
 	actor := a.actors[actorKey(atespace, name)]
 	if actor == nil {
 		return nil, status.Error(codes.NotFound, "missing")
 	}
 	return proto.CloneOf(actor), nil
+}
+
+// ListActorsPage pages Actors in name order; the token is the last name returned.
+func (a *lifecycleTestActors) ListActorsPage(_ context.Context, atespace string, pageSize int32, token string) ([]*ateapipb.Actor, string, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.listCalls++
+	if a.listErr != nil {
+		return nil, "", a.listErr
+	}
+	size := int(pageSize)
+	if a.listPageSize > 0 {
+		size = a.listPageSize
+	}
+	var names []string
+	for _, actor := range a.actors {
+		if name := actor.GetMetadata().GetName(); actor.GetMetadata().GetAtespace() == atespace && name > token {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	next := ""
+	if len(names) > size {
+		names, next = names[:size], names[size-1]
+	}
+	page := make([]*ateapipb.Actor, 0, len(names))
+	for _, name := range names {
+		page = append(page, proto.CloneOf(a.actors[actorKey(atespace, name)]))
+	}
+	return page, next, nil
 }
 
 func (a *lifecycleTestActors) CreateActor(_ context.Context, atespace, name, templateNamespace, templateName string) (*ateapipb.Actor, error) {
@@ -243,7 +280,7 @@ func TestQuiesceRejectsWrongActorIdentity(t *testing.T) {
 			Status:   &ateapipb.ActorStatus{},
 		},
 	}}
-	if _, err := NewActorWorkflow(store, actors, make(chan struct{}, 1), time.Second).Quiesce(t.Context(), session); err == nil {
+	if _, err := NewActorWorkflow(store, actors, make(chan struct{}, 1), time.Second, false).Quiesce(t.Context(), session); err == nil {
 		t.Fatal("Quiesce() accepted the wrong Actor")
 	}
 }
@@ -264,7 +301,7 @@ func (a *snapshotTestActors) SuspendActor(ctx context.Context, atespace, name st
 func TestQuiesceRequiresDurableVolumesSnapshot(t *testing.T) {
 	store, session := lifecycleFixture(t)
 	actors := &snapshotTestActors{lifecycleTestActors: &lifecycleTestActors{actors: map[string]*ateapipb.Actor{}}}
-	workflow := NewActorWorkflow(store, actors, make(chan struct{}, 1), time.Second)
+	workflow := NewActorWorkflow(store, actors, make(chan struct{}, 1), time.Second, false)
 	created, err := workflow.Create(t.Context(), session)
 	require.NoError(t, err)
 
@@ -303,7 +340,7 @@ func TestQuiesceRequiresDurableVolumesSnapshot(t *testing.T) {
 // lifecycleForkFixture retains a real checkpoint and its independent fork history.
 func lifecycleForkFixture(t *testing.T, store *lifecycleTestStore, actors *lifecycleTestActors, source *apiv1.Session) (*apiv1.Session, string) {
 	t.Helper()
-	source, err := NewActorWorkflow(store, actors, make(chan struct{}, 1), time.Second).Create(t.Context(), source)
+	source, err := NewActorWorkflow(store, actors, make(chan struct{}, 1), time.Second, false).Create(t.Context(), source)
 	require.NoError(t, err)
 	message := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("hello"))
 	message.ContextID = source.ContextId
@@ -357,7 +394,7 @@ func TestActorCreationRetainsEgressPolicyFailure(t *testing.T) {
 				session, _ = lifecycleForkFixture(t, store, base, session)
 			}
 			actors := &retryTestActors{lifecycleTestActors: base}
-			workflow := NewActorWorkflow(store, actors, make(chan struct{}, 1), time.Second)
+			workflow := NewActorWorkflow(store, actors, make(chan struct{}, 1), time.Second, false)
 			callsBefore := base.policyCalls
 			base.policyErr = context.DeadlineExceeded
 			_, err := workflow.Create(t.Context(), session)
@@ -384,7 +421,7 @@ func TestActorCreationFailsBeforeIssueWhenEgressPolicyCannotCompile(t *testing.T
 	store, session := lifecycleFixture(t)
 	base := &lifecycleTestActors{actors: map[string]*ateapipb.Actor{}, checkErr: errors.New("target not bound")}
 	actors := &retryTestActors{lifecycleTestActors: base}
-	workflow := NewActorWorkflow(store, actors, make(chan struct{}, 1), time.Second)
+	workflow := NewActorWorkflow(store, actors, make(chan struct{}, 1), time.Second, false)
 
 	_, err := workflow.Create(t.Context(), session)
 	require.ErrorContains(t, err, "target not bound")
@@ -446,7 +483,7 @@ func TestActorEgressCredentialsRequireAllowedDestination(t *testing.T) {
 func TestServiceLifecycleRetriesUseCurrentStateAndRespectDeletion(t *testing.T) {
 	store, fixture := lifecycleFixture(t)
 	actors := &retryTestActors{lifecycleTestActors: &lifecycleTestActors{actors: map[string]*ateapipb.Actor{}}}
-	service := NewService(store, serviceTestAuthorizer{}, NewActorWorkflow(store, actors, make(chan struct{}, 1), time.Second))
+	service := NewService(store, serviceTestAuthorizer{}, NewActorWorkflow(store, actors, make(chan struct{}, 1), time.Second, false))
 	ctx := serviceTestContext("alice")
 	session, err := service.Create(ctx, fixture.Agent.Ref, "retry-request", "conversation")
 	require.NoError(t, err)

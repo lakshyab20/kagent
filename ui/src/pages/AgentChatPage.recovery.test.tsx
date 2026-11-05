@@ -4,7 +4,9 @@ import { ThemeProvider } from "@emotion/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { SWRConfig } from "swr";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createRouterTransport } from "@connectrpc/connect";
+import { Code, ConnectError, createRouterTransport } from "@connectrpc/connect";
+import toast from "react-hot-toast";
+import { ErrorInfoSchema } from "@/generated/google/rpc/error_details_pb";
 import { SessionService } from "@/generated/kagent/api/v1/sessions_pb";
 import { CheckpointService } from "@/generated/kagent/api/v1/checkpoints_pb";
 import { RuntimeOperation, RuntimeState } from "@/generated/kagent/api/v1/runtime_pb";
@@ -43,7 +45,10 @@ vi.mock("@/api", async (importOriginal) => ({
 const ID = "6f1c9d20-1b7a-4a1e-9a3f-2c0d8e5b1a44";
 const LIVE_REFRESH_MS = 4_000;
 
-type Recovery = { needed?: boolean; failedMessages: { taskId: string; messageId: string }[] };
+type Recovery = { needed?: boolean; automatic?: boolean; failedMessages: { taskId: string; messageId: string }[] };
+
+/** The Session's lifecycle, apart from its recovery reading. */
+let lifecycle: { state: RuntimeState; operation: RuntimeOperation };
 
 function session(recovery?: Recovery) {
   return {
@@ -51,28 +56,36 @@ function session(recovery?: Recovery) {
     contextId: ID,
     creator: "alice@example.com",
     agent: { ref: { namespace: "kagent", name: "assistant" }, uid: "agent-uid" },
-    state: RuntimeState.READY,
-    operation: RuntimeOperation.NONE,
+    ...lifecycle,
     recovery,
   };
 }
 
 const HEALTHY: Recovery = { needed: false, failedMessages: [] };
 const CRASHED: Recovery = { needed: true, failedMessages: [] };
+const IDLE = { state: RuntimeState.READY, operation: RuntimeOperation.NONE };
+/** An automatic attempt admitted the recovery, then failed; the next one is minutes away. */
+const ADMITTED = { state: RuntimeState.FAILED, operation: RuntimeOperation.RESUME };
 
 let backend: Recovery;
 let getSession: ReturnType<typeof vi.fn>;
 let revertSession: ReturnType<typeof vi.fn>;
+function recovered() {
+  backend = HEALTHY;
+  lifecycle = IDLE;
+  return { session: session(backend) };
+}
+
+type Reverted = ReturnType<typeof recovered>;
+/** What RevertSession does; by default it recovers the Session. */
+let revert: () => Reverted | Promise<Reverted>;
 
 function renderPage() {
   setApiTransport(createRouterTransport(({ service }) => {
     service(SessionService, {
       getSession: (getSession = vi.fn(() => ({ session: session(backend) }))),
       listSessions: () => ({ sessions: [session(backend)] }),
-      revertSession: (revertSession = vi.fn(() => {
-        backend = HEALTHY;
-        return { session: session(backend) };
-      })),
+      revertSession: (revertSession = vi.fn(() => revert())),
     });
     service(CheckpointService, { listCheckpoints: () => ({ checkpoints: [] }) });
   }));
@@ -103,9 +116,12 @@ beforeEach(() => {
   // transport keep their real timeouts and promises.
   vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
   vi.mocked(chat.refreshTranscript).mockClear();
+  lifecycle = IDLE;
+  revert = recovered;
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.useRealTimers();
   setApiTransport(undefined);
 });
@@ -152,5 +168,76 @@ describe("a crash found on an open conversation", () => {
     expect(getSession.mock.calls.length).toBeGreaterThan(reads);
     expect(chat.refreshTranscript).toHaveBeenCalled();
     expect(screen.queryByText("The agent runtime crashed")).not.toBeInTheDocument();
+  });
+});
+
+/*
+ * An admitted recovery keeps its RESUME operation through every failed attempt. The page
+ * used to disable Revert for as long as that operation stood, so once the first automatic
+ * attempt failed the button spun until a later attempt succeeded, with nothing to press.
+ */
+describe("a recovery admitted by a failed automatic attempt", () => {
+  const revertButton = () => screen.getByRole("button", { name: /Revert to last snapshot/ });
+
+  it("keeps Revert usable, and a click joins the admitted recovery", async () => {
+    backend = { needed: true, automatic: true, failedMessages: [] };
+    lifecycle = ADMITTED;
+    renderPage();
+    await screen.findByText("Recovering this conversation");
+    await waitFor(() => expect(revertButton()).toBeEnabled());
+
+    await userEvent.click(revertButton());
+
+    await waitFor(() => expect(screen.queryByText("Recovering this conversation")).not.toBeInTheDocument());
+    expect(revertSession).toHaveBeenCalledOnce();
+    expect(chat.refreshTranscript).toHaveBeenCalled();
+  });
+
+  it("sends one request for a double click, and leaves Revert usable when other work refuses it", async () => {
+    const error = vi.spyOn(toast, "error");
+    let refuse!: () => void;
+    revert = () => new Promise<Reverted>((_, reject) => {
+      refuse = () => reject(new ConnectError("lifecycle operation is pending", Code.Aborted));
+    });
+    backend = { needed: true, automatic: true, failedMessages: [] };
+    lifecycle = ADMITTED;
+    renderPage();
+    await screen.findByText("Recovering this conversation");
+    await waitFor(() => expect(revertButton()).toBeEnabled());
+
+    // Two clicks before React re-renders the button disabled.
+    act(() => {
+      revertButton().click();
+      revertButton().click();
+    });
+    await waitFor(() => expect(revertButton()).toBeDisabled());
+    expect(revertSession).toHaveBeenCalledOnce();
+
+    await act(async () => refuse());
+
+    await waitFor(() => expect(revertButton()).toBeEnabled());
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("Could not recover the conversation"));
+    expect(screen.getByText("Recovering this conversation")).toBeInTheDocument();
+  });
+
+  it("re-reads quietly when another attempt recovered the conversation first", async () => {
+    const error = vi.spyOn(toast, "error");
+    revert = () => {
+      recovered();
+      throw new ConnectError("runtime is not crashed", Code.FailedPrecondition, undefined, [
+        { desc: ErrorInfoSchema, value: { domain: "kagent.dev", reason: "KAGENT_SESSION_RUNTIME_NOT_CRASHED" } },
+      ]);
+    };
+    backend = { needed: true, automatic: true, failedMessages: [] };
+    lifecycle = ADMITTED;
+    renderPage();
+    await screen.findByText("Recovering this conversation");
+    await waitFor(() => expect(revertButton()).toBeEnabled());
+
+    await userEvent.click(revertButton());
+
+    await waitFor(() => expect(screen.queryByText("Recovering this conversation")).not.toBeInTheDocument());
+    expect(revertSession).toHaveBeenCalledOnce();
+    expect(error).not.toHaveBeenCalled();
   });
 });

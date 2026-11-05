@@ -226,6 +226,8 @@ type SessionRecovery struct {
 	// Whether the recorded runtime crashed and needs a revert. Unset when
 	// GetSession could not observe the runtime; clients must not offer a revert then.
 	Needed *bool `protobuf:"varint,1,opt,name=needed,proto3,oneof" json:"needed,omitempty"`
+	// Whether automatic recovery is enabled for this controller.
+	Automatic bool `protobuf:"varint,2,opt,name=automatic,proto3" json:"automatic,omitempty"`
 	// User messages the restored runtime does not remember, from every revert of
 	// this Session. Each appears once. Their A2A history remains available,
 	// including completed task results, so the list lasts as long as the
@@ -268,6 +270,13 @@ func (*SessionRecovery) Descriptor() ([]byte, []int) {
 func (x *SessionRecovery) GetNeeded() bool {
 	if x != nil && x.Needed != nil {
 		return *x.Needed
+	}
+	return false
+}
+
+func (x *SessionRecovery) GetAutomatic() bool {
+	if x != nil {
+		return x.Automatic
 	}
 	return false
 }
@@ -1352,9 +1361,10 @@ const file_kagent_api_v1_sessions_proto_rawDesc = "" +
 	"\x04name\x18\r \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
 	"context_id\x18\x0e \x01(\tR\tcontextId\x12:\n" +
-	"\brecovery\x18\x10 \x01(\v2\x1e.kagent.api.v1.SessionRecoveryR\brecovery\"\x8a\x01\n" +
+	"\brecovery\x18\x10 \x01(\v2\x1e.kagent.api.v1.SessionRecoveryR\brecovery\"\xa8\x01\n" +
 	"\x0fSessionRecovery\x12\x1b\n" +
-	"\x06needed\x18\x01 \x01(\bH\x00R\x06needed\x88\x01\x01\x12O\n" +
+	"\x06needed\x18\x01 \x01(\bH\x00R\x06needed\x88\x01\x01\x12\x1c\n" +
+	"\tautomatic\x18\x02 \x01(\bR\tautomatic\x12O\n" +
 	"\x0ffailed_messages\x18\x03 \x03(\v2&.kagent.api.v1.SessionMessageReferenceR\x0efailedMessagesB\t\n" +
 	"\a_needed\"Q\n" +
 	"\x17SessionMessageReference\x12\x17\n" +
